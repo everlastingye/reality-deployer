@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 # install-reality.sh — 混合模式一键部署：dokodemo-door + VLESS Reality + SNI 白名单防偷跑
 # 适用：Debian/Ubuntu（18.04/20.04/22.04/12），root 运行
-# 特性：
-# - 环境变量存在 -> 无交互
-# - 缺少参数且是 TTY -> 进入交互补齐
-# - 缺少参数且非 TTY -> 报错退出
 # 变量：DOMAIN(必)、UUID、SHORT_ID、REAL_PORT=443、DOC_PORT=4431、ENABLE_UFW=1、SETCAP=1、SKIP_INSTALL=0、PRINT_IP=1、CONFIRM=auto|yes|no、DRY_RUN=0
 set -euo pipefail
 export LC_ALL=C
@@ -15,9 +11,8 @@ err()  { printf "\033[1;31m[x] %s\033[0m\n" "$*" >&2; exit 1; }
 is_tty(){ [[ -t 0 ]]; }  # 是否交互终端
 require_root() { [[ $EUID -eq 0 ]] || err "请以 root 运行（sudo -i）。"; }
 require_cmd()  { command -v "$1" >/dev/null 2>&1 || err "缺少命令：$1"; }
-esc() { local s=${1//\\/\\\\}; s=${s//\//\\/}; s=${s//&/\\&}; printf '%s' "$s"; }  # sed 转义
+esc() { local s=${1//\\/\\\\}; s=${s//\//\\/}; s=${s//&/\\&}; printf '%s' "$s"; }
 
-# 输入与默认
 DOMAIN="${DOMAIN:-}"; UUID="${UUID:-}"; SHORT_ID="${SHORT_ID:-}"
 REAL_PORT="${REAL_PORT:-443}"; DOC_PORT="${DOC_PORT:-4431}"
 ENABLE_UFW="${ENABLE_UFW:-1}"; SETCAP="${SETCAP:-1}"
@@ -31,7 +26,7 @@ ACCESS_LOG="/var/log/xray/access.log"; ERROR_LOG="/var/log/xray/error.log"
 
 require_root
 
-# 参数收集（混合模式）
+# 参数收集（混合：有变量走无交互；缺变量且是 TTY 就问一次）
 if [[ -z "$DOMAIN" ]]; then
   if is_tty; then
     read -rp "请输入 *伪装域名* (如: junjies.com): " DOMAIN
@@ -41,7 +36,6 @@ if [[ -z "$DOMAIN" ]]; then
 fi
 [[ -z "$UUID" ]] && UUID="$(cat /proc/sys/kernel/random/uuid)"
 [[ -z "$SHORT_ID" ]] && SHORT_ID="$(head -c4 /dev/urandom | hexdump -v -e '/1 \"%02x\"')"
-
 if is_tty; then
   read -rp "自定义 ShortID (默认: $SHORT_ID，回车保持): " _i; [[ -n "${_i:-}" ]] && SHORT_ID="$_i"
   read -rp "自定义 UUID   (默认: $UUID，回车保持): "   _j; [[ -n "${_j:-}" ]] && UUID="$_j"
@@ -79,7 +73,6 @@ if [[ "$SKIP_INSTALL" != "1" ]]; then
 else
   log "跳过 Xray 安装（SKIP_INSTALL=1）"
 fi
-
 require_cmd "$XRAY_BIN"
 log "Xray 版本：$($XRAY_BIN version | head -n1)"
 
@@ -90,7 +83,7 @@ PRIVATE_KEY="$(awk -F': ' '/Private key/{print $2}' <<<"$KEY_RAW")"
 PUBLIC_KEY="$(awk  -F': ' '/Public key/{print $2}'  <<<"$KEY_RAW")"
 [[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || err "生成 Reality 密钥失败"
 
-# 生成配置模板并替换
+# 生成配置并替换
 log "生成配置模板 ..."
 mkdir -p "$(dirname "$CONFIG_PATH")" /var/log/xray
 TMP_CFG="$(mktemp)"
@@ -156,7 +149,7 @@ install -m 0644 "$TMP_CFG" "$CONFIG_PATH"
 rm -f "$TMP_CFG"
 touch "$ACCESS_LOG" "$ERROR_LOG"; chmod 640 "$ACCESS_LOG" "$ERROR_LOG"
 
-# 443 绑定能力：setcap 或以 root 运行
+# 443 绑定能力：setcap 或 root
 if [[ "$SETCAP" == "1" ]]; then
   log "赋予 cap_net_bind_service 能力 ..."
   setcap 'cap_net_bind_service=+ep' "$XRAY_BIN" || true
