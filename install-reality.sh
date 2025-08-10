@@ -1,80 +1,85 @@
 #!/usr/bin/env bash
-# install-reality.sh — 无交互一键部署：dokodemo-door + VLESS Reality + 白名单防偷跑
-# 适用：Ubuntu 18.04/20.04/22.04；以 root 运行；参数通过环境变量传入
+# install-reality.sh — 自动部署 VLESS + Reality (dokodemo-door 白名单版)
+
 set -euo pipefail
 export LC_ALL=C
 
-: "${DOMAIN:?请以环境变量 DOMAIN=example.com 指定伪装域名}"
-UUID="${UUID:-$(cat /proc/sys/kernel/random/uuid)}"
-SHORT_ID="${SHORT_ID:-$(head -c4 /dev/urandom | hexdump -v -e '/1 "%02x"')}"
-REAL_PORT="${REAL_PORT:-443}"
-DOC_PORT="${DOC_PORT:-4431}"
-ENABLE_UFW="${ENABLE_UFW:-1}"
-SETCAP="${SETCAP:-1}"
-SKIP_INSTALL="${SKIP_INSTALL:-0}"
-PRINT_IP="${PRINT_IP:-1}"
+### === 0. 交互式收集基础信息 ====================================== ###
+read -rp "请输入 *伪装域名* (如: junjies.com): " DOMAIN
+read -rp "请确认该域名 A 记录已指向本机 (回车继续) " _
+read -rp "自定义 ShortID (1-16 字符，留空则随机): " SHORT_ID
+read -rp "自定义 UUID (留空则随机): " USER_UUID
 
-XRAY_BIN="/usr/local/bin/xray"
-CONFIG_PATH="/usr/local/etc/xray/config.json"
-SERVICE_FILE="/etc/systemd/system/xray.service"
-ACCESS_LOG="/var/log/xray/access.log"
-ERROR_LOG="/var/log/xray/error.log"
+[[ -z "$SHORT_ID" ]] && SHORT_ID=$(head -c4 /dev/urandom | hexdump -e '"%02x"')
+[[ -z "$USER_UUID" ]] && USER_UUID=$(cat /proc/sys/kernel/random/uuid)
 
-log() { printf "\033[1;32m[+] %s\033[0m\n" "$*"; }
-warn(){ printf "\033[1;33m[!] %s\033[0m\n" "$*"; }
-err() { printf "\033[1;31m[x] %s\033[0m\n" "$*" >&2; exit 1; }
-require_root() { [[ $EUID -eq 0 ]] || err "请以 root 运行（sudo -i）。"; }
-require_cmd() { command -v "$1" >/dev/null 2>&1 || err "缺少命令：$1"; }
+# 端口可改；如需自定义请同步改 ROUTE_PORT & DOC_PORT
+REAL_PORT=443
+DOC_PORT=4431
 
-require_root
-log "安装基础工具 ..."
-export DEBIAN_FRONTEND=noninteractive
+echo -e "\n===== 参数预览 ====="
+printf "伪装域名:  %s\n"   "$DOMAIN"
+printf "UUID:      %s\n"   "$USER_UUID"
+printf "ShortID:   %s\n"   "$SHORT_ID"
+printf "入口端口:  %s\n"   "$REAL_PORT"
+printf "内网端口:  %s\n\n" "$DOC_PORT"
+read -rp "如无误请回车继续，否则 Ctrl+C 退出 "
+
+### === 1. 基础工具 & 更新 ========================================= ###
+echo "[1/9] 更新系统并安装依赖 ..."
 apt-get update -qq
-apt-get install -y -qq curl wget nano unzip socat uuid-runtime ca-certificates libcap2-bin ufw >/dev/null
+apt-get upgrade -y -qq
+apt-get install -y -qq curl wget nano socat setcap uuid-runtime ufw
 
-if [[ "${SKIP_INSTALL}" != "1" ]]; then
-  log "安装/更新 Xray ..."
-  bash <(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) >/dev/null 2>&1
-else
-  log "跳过 Xray 安装（SKIP_INSTALL=1）"
-fi
+### === 2. 安装 Xray Core ========================================= ###
+echo "[2/9] 安装 / 更新 Xray ..."
+bash <(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh) >/dev/null 2>&1
 
-require_cmd "$XRAY_BIN"
-log "Xray 版本：$($XRAY_BIN version | head -n1)"
+### === 3. 生成 Reality 密钥对 ==================================== ###
+echo "[3/9] 生成 Reality X25519 密钥 ..."
+KEY_RAW=$(xray x25519)
+PRIVATE_KEY=$(grep "Private key" <<<"$KEY_RAW" | awk '{print $3}')
+PUBLIC_KEY=$(grep  "Public key"  <<<"$KEY_RAW" | awk '{print $3}')
+echo "  PrivateKey: $PRIVATE_KEY"
+echo "  PublicKey : $PUBLIC_KEY"
 
-log "生成 Reality X25519 密钥 ..."
-KEY_RAW="$($XRAY_BIN x25519)"
-PRIVATE_KEY="$(awk -F': ' '/Private key/{print $2}' <<<"$KEY_RAW")"
-PUBLIC_KEY="$(awk  -F': ' '/Public key/{print $2}'  <<<"$KEY_RAW")"
-[[ -n "$PRIVATE_KEY" && -n "$PUBLIC_KEY" ]] || err "生成 Reality 密钥失败"
+### === 4. 写入配置文件 =========================================== ###
+echo "[4/9] 写入 /usr/local/etc/xray/config.json ..."
+CONFIG_PATH="/usr/local/etc/xray/config.json"
+mkdir -p /usr/local/etc/xray
 
-log "写入配置：$CONFIG_PATH"
-mkdir -p "$(dirname "$CONFIG_PATH")" /var/log/xray
-cat > "$CONFIG_PATH" <<'EOF'
+cat > "$CONFIG_PATH" <<EOF
 {
-  "log": { "loglevel": "info", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
+  "log": {
+    "loglevel": "info",
+    "access": "/var/log/xray/access.log",
+    "error":  "/var/log/xray/error.log"
+  },
   "inbounds": [
     {
       "tag": "dokodemo-in",
-      "port": REAL_PORT_REPLACE,
+      "port": $REAL_PORT,
       "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1", "port": DOC_PORT_REPLACE, "network": "tcp" },
+      "settings": { "address": "127.0.0.1", "port": $DOC_PORT, "network": "tcp" },
       "sniffing": { "enabled": true, "destOverride": ["tls"], "routeOnly": true }
     },
     {
       "tag": "vless-reality-in",
       "listen": "127.0.0.1",
-      "port": DOC_PORT_REPLACE,
+      "port": $DOC_PORT,
       "protocol": "vless",
-      "settings": { "clients": [ { "id": "UUID_REPLACE" } ], "decryption": "none" },
+      "settings": {
+        "clients": [ { "id": "$USER_UUID" } ],
+        "decryption": "none"
+      },
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "dest": "DOMAIN_REPLACE:443",
-          "serverNames": ["DOMAIN_REPLACE"],
-          "privateKey": "PRIVATE_KEY_REPLACE",
-          "shortIds": ["SHORT_ID_REPLACE"]
+          "dest": "$DOMAIN:443",
+          "serverNames": ["$DOMAIN"],
+          "privateKey": "$PRIVATE_KEY",
+          "shortIds": ["$SHORT_ID"]
         }
       },
       "sniffing": { "enabled": true, "destOverride": ["tls","http","quic"], "routeOnly": true }
@@ -87,74 +92,65 @@ cat > "$CONFIG_PATH" <<'EOF'
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      { "type": "field", "inboundTag": ["dokodemo-in"], "domain": ["DOMAIN_REPLACE"], "outboundTag": "direct" },
-      { "type": "field", "inboundTag": ["dokodemo-in"], "outboundTag": "block" }
+      {
+        "type": "field",
+        "inboundTag": ["dokodemo-in"],
+        "domain": ["$DOMAIN"],
+        "outboundTag": "direct"
+      },
+      {
+        "type": "field",
+        "inboundTag": ["dokodemo-in"],
+        "outboundTag": "block"
+      }
     ]
   }
 }
 EOF
 
-# 用实际变量替换占位符
-sed -i "s/REAL_PORT_REPLACE/${REAL_PORT}/g" "$CONFIG_PATH"
-sed -i "s/DOC_PORT_REPLACE/${DOC_PORT}/g" "$CONFIG_PATH"
-sed -i "s/UUID_REPLACE/${UUID}/g" "$CONFIG_PATH"
-sed -i "s/DOMAIN_REPLACE/${DOMAIN}/g" "$CONFIG_PATH"
-sed -i "s/PRIVATE_KEY_REPLACE/${PRIVATE_KEY}/g" "$CONFIG_PATH"
-sed -i "s/SHORT_ID_REPLACE/${SHORT_ID}/g" "$CONFIG_PATH"
+### === 5. 赋予 443 绑定能力 (cap_net_bind_service) ================= ##
+echo "[5/9] 设置二进制绑定特权端口能力 ..."
+setcap 'cap_net_bind_service=+ep' /usr/local/bin/xray
+getcap /usr/local/bin/xray | grep cap_net_bind_service >/dev/null || {
+  echo "Setcap 失败，改用 root 运行 ..."
+  sed -i '/^User=/d' /etc/systemd/system/xray.service
+}
 
-chmod 644 "$CONFIG_PATH"
-touch "$ACCESS_LOG" "$ERROR_LOG"; chmod 640 "$ACCESS_LOG" "$ERROR_LOG"
+### === 6. 创建日志目录 ========================================== ###
+mkdir -p /var/log/xray
+touch /var/log/xray/{access,error}.log
+chmod 640 /var/log/xray/*
 
-if [[ "$SETCAP" == "1" ]]; then
-  log "赋予 cap_net_bind_service ..."
-  setcap 'cap_net_bind_service=+ep' "$XRAY_BIN" || true
-  if ! getcap "$XRAY_BIN" | grep -q cap_net_bind_service; then
-    warn "setcap 失败，改为以 root 运行 xray.service"
-    [[ -f "$SERVICE_FILE" ]] && sed -i '/^User=/d' "$SERVICE_FILE"
-  fi
-fi
-
-if ss -lntp | awk '{print $4" "$7}' | grep -q ":${REAL_PORT} "; then
-  warn "检测到 ${REAL_PORT}/tcp 已被占用："
-  ss -lntp | awk '{print $4" "$7}' | grep ":${REAL_PORT} " || true
-fi
-
-log "启动 Xray ..."
+### === 7. 重载 systemd 并启动 Xray ================================ ###
+echo "[6/9] 重启 xray.service ..."
 systemctl daemon-reload
 systemctl enable --now xray
-sleep 1
-systemctl is-active --quiet xray || { journalctl -u xray --no-pager -n 50 >&2; err "xray.service 启动失败"; }
 
-if [[ "$ENABLE_UFW" == "1" && -x "$(command -v ufw)" ]]; then
-  log "UFW 放行 ${REAL_PORT}/tcp ..."
-  ufw allow "${REAL_PORT}/tcp" >/dev/null || true
-fi
+### === 8. UFW / 安全组放行 443 ================================== ###
+echo "[7/9] 设置防火墙 ..."
+ufw allow $REAL_PORT/tcp >/dev/null || true
 
-log "监听检查："
-ss -lntp | grep -E ":(${REAL_PORT}|${DOC_PORT})\b" || true
+### === 9. 自检监听与状态 ======================================== ###
+echo "[8/9] 自检端口监听 ..."
+ss -lntp | grep ":$REAL_PORT" | grep xray >/dev/null && echo "Xray 已监听 $REAL_PORT" || {
+  echo "Xray 未监听 $REAL_PORT，请检查 systemctl status xray"; exit 1; }
 
-PUBIP="(跳过获取)"; [[ "$PRINT_IP" == "1" ]] && PUBIP="$(curl -s --max-time 3 https://api.ipify.org || echo unknown)"
-cat <<EOF
+echo "[9/9] 部署完成！\n"
 
-========== 已完成部署（无交互版） ==========
-服务器地址   : ${PUBIP}  (或你自有接入域名/IP)
-入口端口     : ${REAL_PORT}
-协议         : VLESS (Reality over TCP)
-UUID         : ${UUID}
-加密/流控    : none / reality
--------------------------------------------
-Reality 公钥 : ${PUBLIC_KEY}
-Reality 短ID : ${SHORT_ID}
-SNI (server) : ${DOMAIN}
-指纹         : chrome / firefox
--------------------------------------------
-配置文件     : ${CONFIG_PATH}
-服务         : systemctl status xray
-日志         : journalctl -u xray -f
-===========================================
-
-客户端要点：
-1) “地址/IP”填本机IP或接入用域名；SNI 必须填 ${DOMAIN}
-2) PublicKey 填上面的“Reality 公钥”，ShortID 填 “${SHORT_ID}”
-3) 若连不通，先看：ss -lntp | grep :${REAL_PORT} 以及 journalctl -u xray -f
-EOF
+cat <<INFO
+================= 客户端参数 =================
+地址 / 域名 : $(curl -s https://api.ipify.org)  (或 $DOMAIN)
+端口        : $REAL_PORT
+协议        : VLESS
+UUID        : $USER_UUID
+加密        : none
+传输层      : tcp
+流控        : reality
+---------------------------------------------
+PublicKey   : $PUBLIC_KEY
+ShortID     : $SHORT_ID
+SNI         : $DOMAIN
+指纹        : chrome / firefox
+=============================================
+如需查看实时日志：  journalctl -u xray -f
+INFO
