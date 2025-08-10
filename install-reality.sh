@@ -35,7 +35,7 @@ if [[ -z "$DOMAIN" ]]; then
   fi
 fi
 [[ -z "$UUID" ]] && UUID="$(cat /proc/sys/kernel/random/uuid)"
-[[ -z "$SHORT_ID" ]] && SHORT_ID="$(head -c4 /dev/urandom | hexdump -v -e '/1 \"%02x\"')"
+[[ -z "$SHORT_ID" ]] && SHORT_ID="$(head -c4 /dev/urandom | hexdump -v -e '1/1 "%02x"')"
 if is_tty; then
   read -rp "自定义 ShortID (默认: $SHORT_ID，回车保持): " _i; [[ -n "${_i:-}" ]] && SHORT_ID="$_i"
   read -rp "自定义 UUID   (默认: $UUID，回车保持): "   _j; [[ -n "${_j:-}" ]] && UUID="$_j"
