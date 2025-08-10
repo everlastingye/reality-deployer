@@ -35,7 +35,15 @@ if [[ -z "$DOMAIN" ]]; then
   fi
 fi
 [[ -z "$UUID" ]] && UUID="$(cat /proc/sys/kernel/random/uuid)"
-[[ -z "$SHORT_ID" ]] && SHORT_ID="$(head -c4 /dev/urandom | hexdump -v -e '1/1 "%02x"')"
+if [[ -z "$SHORT_ID" ]]; then
+  if command -v hexdump >/dev/null 2>&1; then
+    SHORT_ID="$(head -c4 /dev/urandom | hexdump -v -e '1/1 "%02x"')"
+  elif command -v openssl >/dev/null 2>&1; then
+    SHORT_ID="$(openssl rand -hex 4)"
+  else
+    SHORT_ID="$(tr -dc 'a-f0-9' </dev/urandom | head -c8)"
+  fi
+fi
 if is_tty; then
   read -rp "自定义 ShortID (默认: $SHORT_ID，回车保持): " _i; [[ -n "${_i:-}" ]] && SHORT_ID="$_i"
   read -rp "自定义 UUID   (默认: $UUID，回车保持): "   _j; [[ -n "${_j:-}" ]] && UUID="$_j"
@@ -52,7 +60,8 @@ ShortID  : $SHORT_ID
 入口端口 : $REAL_PORT
 内网端口 : $DOC_PORT
 UFW放行  : $ENABLE_UFW
-setcap   : $SETCAP
+绑定策略 : ${BIND_MODE:-dropin}   # dropin/setcap/root
+运行用户 : ${XRAY_USER:-xray}     # 仅 dropin/root 使用
 SKIP安装 : $SKIP_INSTALL
 DRY_RUN  : $DRY_RUN
 ====================
