@@ -50,31 +50,31 @@ PUBLIC_KEY="$(awk  -F': ' '/Public key/{print $2}'  <<<"$KEY_RAW")"
 
 log "写入配置：$CONFIG_PATH"
 mkdir -p "$(dirname "$CONFIG_PATH")" /var/log/xray
-cat > "$CONFIG_PATH" <<EOF
+cat > "$CONFIG_PATH" <<'EOF'
 {
-  "log": { "loglevel": "info", "access": "$ACCESS_LOG", "error": "$ERROR_LOG" },
+  "log": { "loglevel": "info", "access": "/var/log/xray/access.log", "error": "/var/log/xray/error.log" },
   "inbounds": [
     {
       "tag": "dokodemo-in",
-      "port": $REAL_PORT,
+      "port": REAL_PORT_REPLACE,
       "protocol": "dokodemo-door",
-      "settings": { "address": "127.0.0.1", "port": $DOC_PORT, "network": "tcp" },
+      "settings": { "address": "127.0.0.1", "port": DOC_PORT_REPLACE, "network": "tcp" },
       "sniffing": { "enabled": true, "destOverride": ["tls"], "routeOnly": true }
     },
     {
       "tag": "vless-reality-in",
       "listen": "127.0.0.1",
-      "port": $DOC_PORT,
+      "port": DOC_PORT_REPLACE,
       "protocol": "vless",
-      "settings": { "clients": [ { "id": "$UUID" } ], "decryption": "none" },
+      "settings": { "clients": [ { "id": "UUID_REPLACE" } ], "decryption": "none" },
       "streamSettings": {
         "network": "tcp",
         "security": "reality",
         "realitySettings": {
-          "dest": "$DOMAIN:443",
-          "serverNames": ["$DOMAIN"],
-          "privateKey": "$PRIVATE_KEY",
-          "shortIds": ["$SHORT_ID"]
+          "dest": "DOMAIN_REPLACE:443",
+          "serverNames": ["DOMAIN_REPLACE"],
+          "privateKey": "PRIVATE_KEY_REPLACE",
+          "shortIds": ["SHORT_ID_REPLACE"]
         }
       },
       "sniffing": { "enabled": true, "destOverride": ["tls","http","quic"], "routeOnly": true }
@@ -87,12 +87,21 @@ cat > "$CONFIG_PATH" <<EOF
   "routing": {
     "domainStrategy": "IPIfNonMatch",
     "rules": [
-      { "type": "field", "inboundTag": ["dokodemo-in"], "domain": ["$DOMAIN"], "outboundTag": "direct" },
+      { "type": "field", "inboundTag": ["dokodemo-in"], "domain": ["DOMAIN_REPLACE"], "outboundTag": "direct" },
       { "type": "field", "inboundTag": ["dokodemo-in"], "outboundTag": "block" }
     ]
   }
 }
 EOF
+
+# 用实际变量替换占位符
+sed -i "s/REAL_PORT_REPLACE/${REAL_PORT}/g" "$CONFIG_PATH"
+sed -i "s/DOC_PORT_REPLACE/${DOC_PORT}/g" "$CONFIG_PATH"
+sed -i "s/UUID_REPLACE/${UUID}/g" "$CONFIG_PATH"
+sed -i "s/DOMAIN_REPLACE/${DOMAIN}/g" "$CONFIG_PATH"
+sed -i "s/PRIVATE_KEY_REPLACE/${PRIVATE_KEY}/g" "$CONFIG_PATH"
+sed -i "s/SHORT_ID_REPLACE/${SHORT_ID}/g" "$CONFIG_PATH"
+
 chmod 644 "$CONFIG_PATH"
 touch "$ACCESS_LOG" "$ERROR_LOG"; chmod 640 "$ACCESS_LOG" "$ERROR_LOG"
 
@@ -101,7 +110,7 @@ if [[ "$SETCAP" == "1" ]]; then
   setcap 'cap_net_bind_service=+ep' "$XRAY_BIN" || true
   if ! getcap "$XRAY_BIN" | grep -q cap_net_bind_service; then
     warn "setcap 失败，改为以 root 运行 xray.service"
-    if [[ -f "$SERVICE_FILE" ]]; then sed -i '/^User=/d' "$SERVICE_FILE"; fi
+    [[ -f "$SERVICE_FILE" ]] && sed -i '/^User=/d' "$SERVICE_FILE"
   fi
 fi
 
