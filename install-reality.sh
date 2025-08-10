@@ -149,19 +149,68 @@ install -m 0644 "$TMP_CFG" "$CONFIG_PATH"
 rm -f "$TMP_CFG"
 touch "$ACCESS_LOG" "$ERROR_LOG"; chmod 640 "$ACCESS_LOG" "$ERROR_LOG"
 
-# 443 绑定能力：setcap 或 root
-if [[ "$SETCAP" == "1" ]]; then
-  log "赋予 cap_net_bind_service 能力 ..."
-  setcap 'cap_net_bind_service=+ep' "$XRAY_BIN" || true
-  if ! getcap "$XRAY_BIN" | grep -q cap_net_bind_service; then
-    warn "setcap 失败，改为以 root 运行 xray.service"
-    [[ -f "$SERVICE_FILE" ]] && sed -i '/^User=/d' "$SERVICE_FILE"
-    if grep -q '^\[Service\]' "$SERVICE_FILE"; then
-      awk '1; /^\[Service\]$/ && !p {print "CapabilityBoundingSet=CAP_NET_BIND_SERVICE\nAmbientCapabilities=CAP_NET_BIND_SERVICE\nNoNewPrivileges=true"; p=1}' \
-        "$SERVICE_FILE" >"${SERVICE_FILE}.tmp" && mv "${SERVICE_FILE}.tmp" "$SERVICE_FILE"
-    fi
-  fi
-fi
+# ---------- 绑定 443 能力（策略化） ----------
+# BIND_MODE 可选：dropin(默认)/setcap/root
+BIND_MODE="${BIND_MODE:-dropin}"
+XRAY_USER="${XRAY_USER:-xray}"   # dropin/root 模式使用
+
+ensure_bind_443() {
+  case "$BIND_MODE" in
+    dropin)
+      log "配置 systemd drop-in，使非 root 也能绑定 443（推荐） ..."
+      # 1) 专用系统用户
+      if ! id -u "$XRAY_USER" >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin "$XRAY_USER"
+        log "已创建用户：$XRAY_USER"
+      fi
+      # 2) 日志/配置权限
+      mkdir -p /var/log/xray
+      chown -R "$XRAY_USER:$XRAY_USER" /var/log/xray /usr/local/etc/xray || true
+      chmod 750 /var/log/xray || true
+      # 3) drop-in
+      mkdir -p /etc/systemd/system/xray.service.d
+      cat >/etc/systemd/system/xray.service.d/cap.conf <<EOF
+[Service]
+User=$XRAY_USER
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+EOF
+      ;;
+
+    setcap)
+      log "使用 setcap 文件能力绑定 443 ..."
+      require_cmd setcap
+      setcap 'cap_net_bind_service=+ep' "$XRAY_BIN" || warn "setcap 失败，请确认 libcap2-bin 已安装"
+      getcap "$XRAY_BIN" | grep -q cap_net_bind_service || warn "未检测到文件能力，可能无法绑定 443"
+      # 升级后自动补能力（需以 root 启动）
+      mkdir -p /etc/systemd/system/xray.service.d
+      cat >/etc/systemd/system/xray.service.d/precap.conf <<'EOF'
+[Service]
+ExecStartPre=/usr/sbin/setcap cap_net_bind_service=+ep /usr/local/bin/xray
+EOF
+      # 确保 ExecStartPre 以 root 执行
+      sed -i '/^User=/d' /etc/systemd/system/xray.service 2>/dev/null || true
+      ;;
+
+    root)
+      log "直接以 root 运行并附最小能力边界 ..."
+      sed -i '/^User=/d' /etc/systemd/system/xray.service 2>/dev/null || true
+      mkdir -p /etc/systemd/system/xray.service.d
+      cat >/etc/systemd/system/xray.service.d/cap.conf <<'EOF'
+[Service]
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+EOF
+      ;;
+
+    *) err "未知 BIND_MODE：$BIND_MODE（可选 dropin/setcap/root）" ;;
+  esac
+}
+
+ensure_bind_443
+systemctl daemon-reload
 
 # 端口占用提示
 if ss -lntp | awk '{print $4" "$7}' | grep -q ":${REAL_PORT} "; then
@@ -172,13 +221,39 @@ fi
 
 # 启动
 log "启动/重载 Xray ..."
-systemctl daemon-reload
-systemctl enable --now xray
+systemctl enable --now xray || true
 sleep 1
+
+# 如果服务没起来，打印日志并报错
 if ! systemctl is-active --quiet xray; then
   journalctl -u xray --no-pager -n 80 >&2
   err "xray.service 启动失败，请根据上面日志排查。"
 fi
+
+# 自检端口监听；若失败，自动回退到 drop-in 方案再试一次
+if ! ss -lntn | grep -q ":${REAL_PORT} "; then
+  warn "未检测到 ${REAL_PORT}/tcp 监听，自动应用 drop-in 回退方案..."
+  id -u "$XRAY_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin "$XRAY_USER"
+  mkdir -p /etc/systemd/system/xray.service.d /var/log/xray
+  chown -R "$XRAY_USER:$XRAY_USER" /var/log/xray /usr/local/etc/xray || true
+  cat >/etc/systemd/system/xray.service.d/cap.conf <<EOF
+[Service]
+User=${XRAY_USER}
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+EOF
+  systemctl daemon-reload
+  systemctl restart xray
+  sleep 1
+fi
+
+# 仍未监听则给出日志并退出
+if ! ss -lntn | grep -q ":${REAL_PORT} "; then
+  journalctl -u xray --no-pager -n 120 >&2
+  err "仍未监听 ${REAL_PORT}/tcp，请检查日志（能力/端口占用/防火墙）。"
+fi
+
 
 # 防火墙
 if [[ "$ENABLE_UFW" == "1" ]] && command -v ufw >/dev/null 2>&1; then
